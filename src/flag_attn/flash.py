@@ -1,12 +1,59 @@
 import math
 import torch
 import triton
+import numpy as np
 import triton.language as tl
+
+
+# borrowed from: https://github.com/Dao-AILab/flash-attention/compare/main...jfc4050:flash-attention:triton-dropout
+
+def increment_philox_state(increment: int) -> tuple[int, int]:
+    """
+    1. extract the current rng seed and offset
+    2. increment the offset
+    3. then set the new state
+    layout of state tensor is as follows:
+    [states (200 * 4bytes), seed (uint64_t - 8 bytes), offset (uint64_t - 8 bytes)]
+    see https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp#L150-L176
+    """
+    rng_state = torch.cuda.get_rng_state()
+    # reinterpret bytes as uint64_t
+    # (not all of the bytes are supposed to be uint64_t but we only care about reading
+    # the last 16 bytes)
+    rng_state_array_as_uint64 = rng_state.numpy().view(dtype=np.uint64)
+
+    seed = rng_state_array_as_uint64[-2]
+    offset = rng_state_array_as_uint64[-1]
+
+    # increment offset (needs to be multiple of 4)
+    rng_state_array_as_uint64[-1] += int(math.ceil(increment / 4)) * 4
+
+    torch.cuda.set_rng_state(rng_state)
+
+    return int(seed), int(offset)
+
+
+@triton.jit
+def make_dropout_mask(dropout_p, dropout_seed, indices):
+    """integer hashing function rather than using philox PRNG. ends up being a lot faster
+    see http://burtleburtle.net/bob/hash/integer.html
+    Inputs: 
+    * dropout_p: float
+    * dropout_seed: int
+    * indices: [M, N] int32
+    """
+    a = indices.to(tl.uint32, bitcast=True)
+    a ^= dropout_seed  # to introduce dependency on seed
+    a ^= a >> 4
+    a = (a ^ 0xdeadbeef) + (a << 5)
+    a ^= (a >> 11)
+
+    return a > (dropout_p * 4294967295)
 
 
 class FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale):
+    def forward(ctx, q, k, v, causal, sm_scale, dropout_p: float = 0.0):
         # switch device context
         orginal_device_index = torch.cuda.current_device()
         device_index = q.device.index
@@ -85,6 +132,12 @@ class FlashAttention(torch.autograd.Function):
         if sm_scale is None:
             sm_scale = 1. / math.sqrt(D)
 
+        use_dropout = dropout_p > 0 and q.requires_grad
+        if use_dropout: 
+            rng_seed, rng_offset = increment_philox_state(B * H * M * N)
+        else: 
+            rng_seed, rng_offset = 0, 0
+
         # consider using 3d grid to avoid div & rem
         grid = (triton.cdiv(M, BLOCK_M), H, B)
         o = torch.empty_like(q)
@@ -100,6 +153,8 @@ class FlashAttention(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=D, IS_CAUSAL=causal,
             DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n, 
             num_warps=num_warps, num_stages=num_stages,
+            DROPOUT_P=dropout_p, USE_DROPOUT=use_dropout,
+            rng_seed=rng_seed, rng_offset=rng_offset,
         )
 
         ctx.save_for_backward(q, k, v, o, L)
@@ -108,6 +163,8 @@ class FlashAttention(torch.autograd.Function):
         ctx.BLOCK_DMODEL = D
         ctx.P_SEQ = P_SEQ
         ctx.causal = causal
+        ctx.use_dropout = dropout_p > 0 and q.requires_grad
+        ctx.dropout_p = dropout_p
 
         # restore device context
         torch.cuda.set_device(orginal_device_index)
@@ -219,8 +276,8 @@ class FlashAttention(torch.autograd.Function):
         torch.cuda.set_device(orginal_device_index)
         return dq, dk, dv, None, None, None
 
-def attention(q, k, v, causal=False, sm_scale=None):
-    return FlashAttention.apply(q, k, v, causal, sm_scale)
+def attention(q, k, v, causal=False, sm_scale=None, dropout_p: float = 0.0):
+    return FlashAttention.apply(q, k, v, causal, sm_scale, dropout_p)
 
 
 @triton.jit
@@ -235,6 +292,8 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, 
     IS_CAUSAL: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    DROPOUT_P: tl.constexpr, USE_DROPOUT: tl.constexpr,
+    rng_seed: tl.constexpr, rng_offset: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
     # -- grid id --
@@ -325,6 +384,13 @@ def _fwd_kernel(
         m_i_new = tl.maximum(m_i, tl.max(s, 1))
         alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
         p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
+
+        if USE_DROPOUT: 
+            # P_SEQ = N - M; N_CTX = M; (P_SEQ + M) * M = N * M
+            dropout_rng_offset_hb = rng_offset * off_h * N_CTX * (P_SEQ + N_CTX)
+            indices = dropout_rng_offset_hb + (offs_m[:, None] * hi + offs_n[None, :])
+            dropout_mask = make_dropout_mask(DROPOUT_P, rng_seed, indices)
+            p *= tl.where(dropout_mask, 1.0 / (1.0 - DROPOUT_P), 0.0).to(p.dtype)
 
         # -- scale and update acc: acc *= alpha[:, None]--
         acc *= alpha[:, None]
