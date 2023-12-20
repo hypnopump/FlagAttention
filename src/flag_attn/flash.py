@@ -165,6 +165,8 @@ class FlashAttention(torch.autograd.Function):
         ctx.causal = causal
         ctx.use_dropout = dropout_p > 0 and q.requires_grad
         ctx.dropout_p = dropout_p
+        ctx.dropout_rng_seed = rng_seed
+        ctx.dropout_rng_offset = rng_offset
 
         # restore device context
         torch.cuda.set_device(orginal_device_index)
@@ -184,6 +186,10 @@ class FlashAttention(torch.autograd.Function):
         P_SEQ = N - M
         sm_scale = ctx.sm_scale
         causal = ctx.causal
+        use_dropout = ctx.use_dropout
+        dropout_p = ctx.dropout_p
+        rng_seed = ctx.dropout_rng_seed
+        rng_offset = ctx.dropout_rng_offset
 
         # tune for A100, device_capability(8, 0)
         if torch.cuda.get_device_capability(device_index) == (8, 0):
@@ -254,6 +260,8 @@ class FlashAttention(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_DMODEL=D, BLOCK_N=BLOCK_N, CAUSAL=causal,
             DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
             num_stages=num_stages, num_warps=num_warps,
+            DROPOUT_P=dropout_p, USE_DROPOUT=use_dropout,
+            rng_seed=rng_seed, rng_offset=rng_offset,
         )
 
         dq = torch.zeros_like(q) # us float32 for atomic updates
@@ -271,6 +279,8 @@ class FlashAttention(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_DMODEL=D, BLOCK_N=BLOCK_N, CAUSAL=causal,
             DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
             num_stages=num_stages, num_warps = num_warps,
+            DROPOUT_P=dropout_p, USE_DROPOUT=use_dropout,
+            rng_seed=rng_seed, rng_offset=rng_offset,
         )
 
         torch.cuda.set_device(orginal_device_index)
@@ -383,7 +393,7 @@ def _fwd_kernel(
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(s, 1))
         alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
-        p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
+        p = tl.math.exp2((s - m_i_new[:, None]) * qk_scale)
 
         if USE_DROPOUT: 
             # P_SEQ = N - M; N_CTX = M; (P_SEQ + M) * M = N * M
@@ -474,6 +484,8 @@ def _bwd_kv_kernel(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    DROPOUT_P: tl.constexpr, USE_DROPOUT: tl.constexpr,
+    rng_seed: tl.constexpr, rng_offset: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
     # -- grid id --
@@ -560,17 +572,35 @@ def _bwd_kv_kernel(
             l = tl.load(L + offs_m, mask=mask_m)
         p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
 
+        if USE_DROPOUT:
+            # P_SEQ = N - M; N_CTX = M; (P_SEQ + M) * M = N * M
+            dropout_rng_offset_hb = rng_offset * off_h * N_CTX * (P_SEQ + N_CTX)
+            indices = dropout_rng_offset_hb + (offs_m[:, None] + offs_n[None, :])
+
+            # compute Zij (sort of, see below). has values:
+            #   1 / (1 - p) with prob 1 - p, 0 with prob p
+
+            # don't need to materialize Zij, just store drop bit into sign bit of Pij
+            # (trick stolen from CUDA implementation) to save SRAM/registers
+            dropout_mask = make_dropout_mask(DROPOUT_P, rng_seed, indices)
+            p *= tl.where(dropout_mask, 1.0, -1.0)
+
         if not DIVISIBLE_M:
             p = tl.where(valid_mask, p, 0.0)
         if CAUSAL:
             p = tl.where(causal_mask, p, 0.0)
 
-        # compute dv = dot(p, do)
+        # compute dv = dot(p, do) # (BLOCK_N, BLOCK_DMODEL)
         if DIVISIBLE_M:
             do = tl.load(do_ptrs)
         else:
             do = tl.load(do_ptrs, mask=mask_m[:, None]) # (BLOCK_M, BLOCK_DMODEL)
-        dv += tl.dot(tl.trans(p.to(do.dtype)), do) # (BLOCK_N, BLOCK_DMODEL)  # still correct
+
+        if USE_DROPOUT:
+            p_dropped = tl.where(dropout_mask, p * (1.0 / (1.0 - DROPOUT_P)), 0.0)
+            dv += tl.dot(tl.trans(p_dropped.to(do.dtype)), do) # (BLOCK_N, BLOCK_DMODEL)
+        else: 
+            dv += tl.dot(tl.trans(p.to(do.dtype)), do) # (BLOCK_N, BLOCK_DMODEL)
 
         # compute dp = dot(v, do)
         if DIVISIBLE_M:
@@ -581,8 +611,36 @@ def _bwd_kv_kernel(
         dp += tl.dot(do, tl.trans(v))
 
         # compute ds = p * (dp - delta[:, None])
-        ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
+        if USE_DROPOUT: 
+            # we don't need to explicitly compute dPij from dPij_dropped, see below where
+            # we compute dSij for more details.
+            # for computing dSij = tau * Pij * (dPij - Di)
+            # we have:
+            #   - Pij' which has negative values where Zij = 0, otherwise same as Pij
+            #   - dPij' = dPij_dropped
+            #
+            # IF KEEPING:
+            #   Pij = Pij'
+            #   dPij = dPij'
+            #
+            #   Pij * (dPij - Di) = Pij' * (dPij' - Di)
+            #                     = Pij' * ((dPij' * (1 / (1 - p))) - Di)
+            #
+            # IF DROPPING:
+            #   Pij = -Pij'
+            #   dPij = 0
+            #
+            #   Pij * (dPij - Di) = Pij * (0 - Di)
+            #                     = Pij * -Di
+            #                     = -Pij * Di
+            #                     = Pij' * Di
+            #   note earlier we flipped sign of p if element was to be dropped
+            ds = p * tl.where(dropout_mask, (dp * (1.0 / (1.0 - DROPOUT_P))) - delta[:, None], delta[:, None])
+            ds = ds.to(q.dtype)
+        else: 
+            ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
 
+        # TODO: why? ds should be 0. alredy in the masked 0. positions. 
         if not DIVISIBLE_M:
             ds = tl.where(valid_mask, ds, 0.0)
         if CAUSAL:
@@ -590,13 +648,12 @@ def _bwd_kv_kernel(
         ds = ds.to(input_dtype)
 
         # compute dk = dot(ds.T, q) masking
-        dk += tl.dot(tl.trans(ds), q)
+        dk += tl.dot(tl.trans(ds), q) * sm_scale
 
         # increment pointers
         q_ptrs += BLOCK_M * stride_qm
         do_ptrs += BLOCK_M * stride_dom
 
-    dk *= sm_scale
     if DIVISIBLE_N:
         tl.store(dk_ptrs, dk.to(input_dtype)) # (BLOCK_N, BLOCK_DMODEL)
         tl.store(dv_ptrs, dv.to(input_dtype)) # (BLOCK_N, BLOCK_DMODEL,)
@@ -620,6 +677,8 @@ def _bwd_q_kernel(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr, 
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    DROPOUT_P: tl.constexpr, USE_DROPOUT: tl.constexpr,
+    rng_seed: tl.constexpr, rng_offset: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
     # -- grid id --
@@ -710,6 +769,19 @@ def _bwd_q_kernel(
         #     s = tl.where(valid_mask, s, float("-inf"))
         p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
 
+        if USE_DROPOUT:
+            # P_SEQ = N - M; N_CTX = M; (P_SEQ + M) * M = N * M
+            dropout_rng_offset_hb = rng_offset * off_h * N_CTX * (P_SEQ + N_CTX)
+            indices = dropout_rng_offset_hb + (offs_m[:, None] * hi + offs_n[None, :])
+
+            # compute Zij (sort of, see below). has values:
+            #   1 / (1 - p) with prob 1 - p, 0 with prob p
+
+            # don't need to materialize Zij, just store drop bit into sign bit of Pij
+            # (trick stolen from CUDA implementation) to save SRAM/registers
+            dropout_mask = make_dropout_mask(DROPOUT_P, rng_seed, indices)
+            p *= tl.where(dropout_mask, 1.0, -1.0)
+
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         dp += tl.dot(do.to(input_dtype), tl.trans(v))
@@ -720,8 +792,34 @@ def _bwd_q_kernel(
         #     dp = tl.where(valid_mask, dp, 0.0)
 
         # compute ds = p * (dp - delta[:, None])
-        # move scale out to dq at last
-        ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
+        if USE_DROPOUT: 
+            # we don't need to explicitly compute dPij from dPij_dropped, see below where
+            # we compute dSij for more details.
+            # for computing dSij = tau * Pij * (dPij - Di)
+            # we have:
+            #   - Pij' which has negative values where Zij = 0, otherwise same as Pij
+            #   - dPij' = dPij_dropped
+            #
+            # IF KEEPING:
+            #   Pij = Pij'
+            #   dPij = dPij'
+            #
+            #   Pij * (dPij - Di) = Pij' * (dPij' - Di)
+            #                     = Pij' * ((dPij' * (1 / (1 - p))) - Di)
+            #
+            # IF DROPPING:
+            #   Pij = -Pij'
+            #   dPij = 0
+            #
+            #   Pij * (dPij - Di) = Pij * (0 - Di)
+            #                     = Pij * -Di
+            #                     = -Pij * Di
+            #                     = Pij' * Di
+            #   note earlier we flipped sign of p if element was to be dropped
+            ds = p * tl.where(dropout_mask, (dp * (1.0 / (1.0 - DROPOUT_P))) - delta[:, None], delta[:, None])
+            ds = ds.to(q.dtype)
+        else: 
+            ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
 
         # mask ds to ensure no small values
         if not DIVISIBLE_N:
@@ -729,13 +827,12 @@ def _bwd_q_kernel(
         if CAUSAL:
             ds = tl.where(causal_mask, ds, 0.0)
 
-        dq += tl.dot(ds.to(input_dtype), k)
+        dq += tl.dot(ds.to(input_dtype), k) * sm_scale
 
         # increment pointers
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vn
     
-    dq *= sm_scale
     if DIVISIBLE_M:
         tl.store(dq_ptrs, dq.to(input_dtype))
     else:
